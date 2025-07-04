@@ -1,0 +1,83 @@
+# syntax=docker/dockerfile:1
+
+# --- Runtime Stage: Python 3.11 with UI dependencies ---
+FROM python:3.11-slim
+
+# Add labels for better container management
+LABEL org.opencontainers.image.source="https://github.com/khushalpujara/hello_grpc"
+LABEL org.opencontainers.image.description="gRPC Hello World UI Service"
+LABEL org.opencontainers.image.licenses="MIT"
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Install system dependencies including curl for health checks
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies (from lock file for reproducibility)
+COPY requirements_lock.txt ./
+RUN pip install --no-cache-dir -r requirements_lock.txt \
+    # grpcio-tools is needed for proto code generation
+    && pip install --no-cache-dir grpcio-tools
+
+# Copy the full Python package source tree (including __init__.py files)
+COPY khushal_hello_grpc/ ./khushal_hello_grpc/
+
+# Copy proto definitions into the image for code generation
+COPY protos/hello.proto /app/protos/hello.proto
+
+# Generate Python gRPC code from the proto file
+# - Outputs to the correct package directory
+# - Touches __init__.py to ensure it's a package
+# - Patches hello_pb2_grpc.py to use relative imports (required for Bazel-style package structure)
+RUN python -m grpc_tools.protoc -I/app/protos \
+    --python_out=/app/khushal_hello_grpc/src/generated \
+    --grpc_python_out=/app/khushal_hello_grpc/src/generated \
+    /app/protos/hello.proto \
+    && touch /app/khushal_hello_grpc/src/generated/__init__.py \
+    && sed -i 's/import hello_pb2 as hello__pb2/from . import hello_pb2 as hello__pb2/' \
+    /app/khushal_hello_grpc/src/generated/hello_pb2_grpc.py
+
+# Copy the UI server implementation
+COPY khushal_hello_grpc/src/ui/server/server.py ./ui_server.py
+
+# Copy static files to the expected location
+COPY khushal_hello_grpc/src/ui/frontend/static ./static
+
+# Verify static files are copied correctly
+RUN ls -la ./static && \
+    echo "Static files copied successfully" && \
+    if [ ! -f ./static/index.html ]; then \
+        echo "Warning: index.html not found in static directory"; \
+        echo "Contents of static directory:"; \
+        ls -la ./static/; \
+    fi
+
+# Expose the UI port
+EXPOSE 8081
+
+ENV PYTHONPATH=/app
+ENV APP_ENV=PROD
+
+# Health check for UI server - more lenient to prevent CrashLoopBackOff
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
+    CMD curl -f http://localhost:8081/api/health || exit 0
+
+# Create a startup script to handle potential issues
+RUN echo '#!/bin/bash\n\
+echo "Starting gRPC UI Server..."\n\
+echo "Environment variables:"\n\
+echo "  GRPC_SERVER_HOST: ${GRPC_SERVER_HOST:-localhost}"\n\
+echo "  GRPC_SERVER_PORT: ${GRPC_SERVER_PORT:-50051}"\n\
+echo "  UI_SERVER_PORT: ${UI_SERVER_PORT:-8081}"\n\
+echo "  APP_ENV: ${APP_ENV:-DEV}"\n\
+echo "Static files location: /app/static"\n\
+ls -la /app/static\n\
+echo "Starting server..."\n\
+exec python ui_server.py\n\
+' > /app/start.sh && chmod +x /app/start.sh
+
+# Entrypoint: use the startup script
+ENTRYPOINT ["/app/start.sh"] 
